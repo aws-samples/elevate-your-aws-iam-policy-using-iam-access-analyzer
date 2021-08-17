@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys AWS resources to analyze AWS IAM policies using IAM Access Analyzer ValidatePolicy API call and stores results into an Amazon S3 bucket. The results are queried via Amazon Athena.
+
+Resources:
+  #################################################################################
+  #   AWS Lambda function  list-iam-policy-for-access-analyzer resources          #
+  #################################################################################
+  LambdaFunctionListPolicies:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Serverlesss implementation. Does not require to be deployed in a VPC."
+    Properties:
+      FunctionName: list-iam-policy-for-access-analyzer
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaFunctionListPoliciesDLQ.Arn
+      Runtime: python3.8
+      MemorySize: 128
+      Role: !GetAtt LambdaRoleListPolicies.Arn
+      Handler: index.handler
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+          import logging
+
+          logging.basicConfig(level=logging.DEBUG)
+          logger=logging.getLogger(__name__)
+          logger.setLevel(logging.DEBUG)
+
+          sqs = boto3.client('sqs')
+          SQS_QUEUE_URL = os.environ['SQS_QUEUE_URL']
+
+          def handler(event, context):
+            iam_resource = boto3.resource('iam')
+            for p in iam_resource.policies.filter(Scope='Local'):
+              try:
+                sqs.send_message(
+                  QueueUrl=SQS_QUEUE_URL,
+                  DelaySeconds=10,
+                  MessageAttributes={
+                    'policyArn': {
+                      'DataType': 'String',
+                      'StringValue': p.arn
+                    },
+                    'policyType':{
+                      'DataType': 'String',
+                      'StringValue': 'IDENTITY_POLICY'
+                    },
+                    'policyName':{
+                      'DataType': 'String',
+                      'StringValue': p.policy_name
+                    },
+                    'policyPath':{
+                      'DataType': 'String',
+                      'StringValue': p.path
+                    },
+                    'policyId':{
+                      'DataType': 'String',
+                      'StringValue': p.policy_id
+                    },
+                    'policyDefaultVersionId':{
+                      'DataType': 'String',
+                      'StringValue': p.default_version_id
+                    },
+                    'policyAttachmentCount':{
+                      'DataType': 'Number',
+                      'StringValue': str(p.attachment_count)
+                    },
+                    'policyPermissionsBoundaryUsageCount':{
+                      'DataType': 'Number',
+                      'StringValue': str(p.permissions_boundary_usage_count)
+                    }
+                  },
+                  MessageBody=(
+                    json.dumps(p.default_version.document)
+                  )
+                )
+              except ClientError as e:
+                logger.error("An error occured: {0}".format(e))
+            return {
+              'statusCode': 200,
+              'body': json.dumps('OK from Lambda')
+            }
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref CFQueue
+      Description: !Sub 'Lambda function to list customer IAM policies and send them to the SQS queue ${CFQueue}.'
+      KmsKeyArn: !GetAtt KMSKey.Arn      
+  LambdaFunctionListPoliciesDLQ: 
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref KMSKey
+  LambdaRoleListPolicies:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+      Path: /
+      Tags:
+      - Key: 'CloudFormation::StackId'
+        Value: !Ref AWS::StackId
+      - Key: 'CloudFormation::StackName'
+        Value: !Ref AWS::StackName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - 
+         PolicyName: "ListIAMPolicyForAccessAnalyzer"
+         PolicyDocument:
+           Version: "2012-10-17"
+           Statement:
+              - Effect: "Allow"
+                Action:
+                  - "iam:GetPolicyVersion"
+                  - "iam:ListPolicies"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
+              - Effect: "Allow"
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                  - "kms:GenerateDataKey"
+                Resource: !GetAtt KMSKey.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                Resource: "*"
+  LambdaFunctionListLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: 14
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionListPolicies}'
+  ############################
+  #   Amazon SQS resources   #
+  ############################
+  CFQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      VisibilityTimeout: 300
+      Tags:
+      - Key: 'CloudFormation::StackId'
+        Value: !Ref AWS::StackId
+      - Key: 'CloudFormation::StackName'
+        Value: !Ref AWS::StackName
+      KmsMasterKeyId: !Ref KMSKey
+      RedrivePolicy: 
+        deadLetterTargetArn: !GetAtt CFDeadLetterQueue.Arn          
+        maxReceiveCount: 5
+  CFDeadLetterQueue: 
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref KMSKey
+  CFSQSPolicy: 
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      Queues: 
+        - !Ref CFQueue
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "SQS:SendMessage"
+            Effect: "Allow"
+            Resource: !GetAtt CFQueue.Arn
+            Principal:  
+              AWS: 
+                - !GetAtt LambdaRoleListPolicies.Arn
+  #################
+  #   AWS KMS     #
+  #################
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-policy
+        Statement:
+        - Sid: Enable IAM Permissions
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Join:
+              - ''
+              - - 'arn:aws:iam::'
+                - Ref: AWS::AccountId
+                - :root
+          Action: kms:*
+          Resource: '*'
+      Tags:
+      - Key: 'CloudFormation::StackId'
+        Value: !Ref AWS::StackId
+      - Key: 'CloudFormation::StackName'
+        Value: !Ref AWS::StackName
+  KMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: alias/elevate-your-iam-policy-implem-key
+      TargetKeyId: !Ref KMSKey
+  #################################################################################
+  #   AWS Lambda function  validate-iam-policy-for-access-analyzer resources      #
+  #################################################################################
+  LambdaFunctionValidatePolicies:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Serverlesss implementation. Does not require to be deployed in a VPC."
+    Properties:
+      FunctionName: validate-iam-policy-for-access-analyzer
+      Runtime: python3.8
+      MemorySize: 128
+      Role: !GetAtt LambdaRoleValidatePolicies.Arn
+      Handler: index.handler
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import gzip
+          import boto3
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          import logging
+
+          logging.basicConfig(level=logging.DEBUG)
+          logger=logging.getLogger(__name__)
+          logger.setLevel(logging.DEBUG)
+
+          accessanalyzer_client = boto3.client('accessanalyzer')
+          sqs = boto3.client('sqs')
+          s3 = boto3.resource("s3")
+          S3_BUCKET = os.environ['S3_BUCKET']
+          SQS_QUEUE_URL = os.environ['SQS_QUEUE_URL']
+          ACCOUNT_ID = os.environ['ACCOUNT_ID']
+
+          def handler(event, context):            
+            finding = {}
+            logger.debug(f"{len(event['Records'])} are being processed...")
+            for record in event['Records']:
+              finding["policyArn"] = record["messageAttributes"]["policyArn"]["stringValue"]
+              finding["policyType"] = record["messageAttributes"]["policyType"]["stringValue"]
+              finding["path"] = record["messageAttributes"]["policyPath"]["stringValue"]
+              finding["policyId"] = record["messageAttributes"]["policyId"]["stringValue"]
+              finding["policyName"] = record["messageAttributes"]["policyName"]["stringValue"]
+              finding["defaultVersionId"] = record["messageAttributes"]["policyDefaultVersionId"]["stringValue"]
+              finding["attachmentCount"] = record["messageAttributes"]["policyAttachmentCount"]["stringValue"]
+              finding["permissionsBoundaryUsageCount"] = record["messageAttributes"]["policyPermissionsBoundaryUsageCount"]["stringValue"]
+              access_analyzer_response = accessanalyzer_client.validate_policy(                  
+                  policyDocument=record["body"],
+                  policyType=finding["policyType"]
+              )
+              finding["access_analyzer_findings"] = access_analyzer_response["findings"]
+
+              # add date and time when policy was analyzed
+              date_time_now = datetime.now()
+              date_time_string = date_time_now.isoformat()
+              finding["validatedAt"] = date_time_string
+
+              date_string = date_time_now.strftime("%Y/%m/%d")
+              file_path = f"AWSAccessAnalyzerFindings/{ACCOUNT_ID}/{date_string}/AccessAnalyzerOutput/"
+              file_name = f"{ACCOUNT_ID}_AccessAnalyzer_Output_{date_time_string}.gz"
+              s3_key = file_path + file_name
+
+              #push access analyzer finding to the s3 bucket
+              try:
+                encoded_string = json.dumps(finding).encode("utf-8")
+                gzip_string = gzip.compress(encoded_string)
+                s3.Bucket(S3_BUCKET).put_object(Key=s3_key, Body=gzip_string)
+                logger.debug(f"SUCCESS - {ACCOUNT_ID} - export to S3 bucket s3://{S3_BUCKET}/{file_path}/{file_name}")
+                
+                receipt_handle = record['receiptHandle']
+                # Delete received message from queue
+                sqs.delete_message(
+                    QueueUrl=SQS_QUEUE_URL,
+                    ReceiptHandle=receipt_handle
+                )
+              except Exception as e:
+                logger.debug(f"FAILED - {ACCOUNT_ID}  - export to S3 bucket s3://{S3_BUCKET}/{file_path}/{file_name}")
+                raise Exception(f"Unable to process findings for {finding['policyArn']}")
+
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref CFQueue
+          S3_BUCKET: !Ref s3Bucket
+          ACCOUNT_ID: !Ref AWS::AccountId
+      Description: !Sub 'Lambda function to validate customer IAM policies and save output to a S3 bucket: ${s3Bucket}'
+      KmsKeyArn: !GetAtt KMSKey.Arn
+  LambdaRoleValidatePolicies:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Access Analyzer ValidatePolicy API Call does not support a resource. you must specify all resources (\"*\") in the Resource element of your policy statement."
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - 
+         PolicyName: "ValidateIAMPolicyUsingAccessAnalyzer"
+         PolicyDocument:
+           Version: "2012-10-17"
+           Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                  - "kms:GenerateDataKey"
+                Resource: !GetAtt KMSKey.Arn
+              - Effect: "Allow"
+                Action: 
+                  - "access-analyzer:ValidatePolicy"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: 
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource: 
+                  - !Sub "arn:aws:s3:::${s3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${s3Bucket}"
+              - Effect: "Allow"
+                Action: 
+                  - "sqs:SendMessage"
+                Resource: "*"
+  LambdaFunctionValidateLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: 14
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionValidatePolicies}'
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      FunctionName: !Ref LambdaFunctionValidatePolicies      
+      EventSourceArn: !GetAtt CFQueue.Arn 
+  ########################################
+  #  Amazon S3 bucket to store findings  #
+  ########################################
+  s3Bucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: "Access intended only within the same account"
+    Properties: 
+      AccessControl: Private
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+      PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  LoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: "Access intended only within the same account"
+          - id: W35
+            reason: "This is a S3 bucket to store access logs from s3Bucket."
+    Properties:
+      AccessControl: LogDeliveryWrite
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  ######################################
+  #   AWS CloudWatch Events resources  #
+  ######################################
+  scheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled event rule to validate IAM policies using IAM Access Analyzer.
+      ScheduleExpression: "rate(12 hours)"
+      State:  "ENABLED"
+      Targets:
+      - 
+        Arn: !GetAtt LambdaFunctionListPolicies.Arn
+        Id: "TargetLambdaFunctionListPolicies"       
+  permissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionListPolicies
+      Action:  "lambda:InvokeFunction"
+      Principal:  "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt:
+          - "scheduledRule"
+          - "Arn"
+  ###########################
+  #   AWS Glue resources    #
+  ###########################
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: 'access_analyzer_findings'
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: access_analyzer_findings
+        Owner: owner
+        Retention: 0
+        StorageDescriptor:
+          Location: !Sub s3://${s3Bucket}/
+          Columns:
+            - Name: policyarn
+              Type: string
+            - Name: policytype
+              Type: string
+            - Name: path
+              Type: string
+            - Name: policyid
+              Type: string
+            - Name: policyname
+              Type: string              
+            - Name: defaultversionid
+              Type: string
+            - Name: attachmentcount
+              Type: string
+            - Name: permissionsboundaryusagecount
+              Type: string
+            - Name: validatedAt
+              Type: string
+            - Name: access_analyzer_findings
+              Type: array<struct<findingDetails:string,findingType:string,issueCode:string,learnMoreLink:string,locations:array<struct<path:array<struct<value:string,index:int>>,span:struct<end:struct<column:int,line:int,offset:int>,start:struct<column:int,line:int,offset:int>>>>>>
+            
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: g.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: true
+          NumberOfBuckets: -1
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              paths: 'AttachmentCount,DefaultVersionId,Path,PermissionsBoundaryUsageCount,access_analyzer_findings,policyArn,policyId,policyName,policyType'
+          BucketColumns: []
+          SortColumns: []
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: datehour
+            Type: string
+        Parameters:
+          projection.enabled: true
+          projection.datehour.type: 'date'
+          projection.datehour.range: '2021/07/29,NOW'
+          projection.datehour.format: 'yyyy/MM/dd'
+          projection.datehour.interval: '1'
+          projection.datehour.interval.unit: 'DAYS'
+          storage.location.template: !Sub 's3://${s3Bucket}/AWSAccessAnalyzerFindings/${AWS::AccountId}/${!datehour}/AccessAnalyzerOutput'
+          classification: json
+          compressionType: gzip
+          typeOfData: file
+        TableType: EXTERNAL_TABLE
+  GlueAccessAnalzyerFindingTable:
+    Type: 'AWS::Glue::Table'
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Description: Athena View Table for Access Analyzer Findings
+        Name: v_access_analyzer_finding_view
+        Parameters:
+          presto_view: 'true'
+          comment: Presto View
+        PartitionKeys: []
+        StorageDescriptor:
+          Columns:
+            - Name: policyarn
+              Type: string            
+            - Name: policytype
+              Type: string            
+            - Name: path
+              Type: string
+            - Name: policyid
+              Type: string
+            - Name: policyname
+              Type: string              
+            - Name: validatedat
+              Type: string
+            - Name: findingtype
+              Type: string
+            - Name: issuecode
+              Type: string
+            - Name: findingdetails
+              Type: string
+            - Name: learnmorelink
+              Type: string
+            - Name: datehour
+              Type: string
+          InputFormat: ''
+          Location: ''
+          NumberOfBuckets: 0
+          OutputFormat: ''
+          SerdeInfo: {}
+        TableType: VIRTUAL_VIEW
+        ViewExpandedText: /* Presto View */
+        ViewOriginalText: >-
+          /* Presto View:
+          eyJvcmlnaW5hbFNxbCI6IlNFTEVDVFxuICBwb2xpY3lBcm5cbiwgcG9saWN5dHlwZVxuLCBwYXRoXG4sIHBvbGljeWlkXG4sIHBvbGljeW5hbWVcbiwgdmFsaWRhdGVkYXRcbiwgZmluZGluZy5maW5kaW5ndHlwZVxuLCBmaW5kaW5nLmlzc3VlY29kZVxuLCBmaW5kaW5nLmZpbmRpbmdkZXRhaWxzXG4sIGZpbmRpbmcubGVhcm5tb3JlbGlua1xuLCBkYXRlaG91clxuRlJPTVxuICAoKFwiYWNjZXNzX2FuYWx5emVyX2ZpbmRpbmdzXCIuXCJhY2Nlc3NfYW5hbHl6ZXJfZmluZGluZ3NcIlxuQ1JPU1MgSk9JTiBVTk5FU1QoYWNjZXNzX2FuYWx5emVyX2ZpbmRpbmdzKSB0IChmaW5kaW5nKSlcbklOTkVSIEpPSU4gKFxuICAgU0VMRUNUIFwibWF4XCIodmFsaWRhdGVkYXQpIGxhdGVzdF92YWxpZGF0ZWRhdFxuICAgRlJPTVxuICAgICBcImFjY2Vzc19hbmFseXplcl9maW5kaW5nc1wiLlwiYWNjZXNzX2FuYWx5emVyX2ZpbmRpbmdzXCJcbiAgIEdST1VQIEJZIHBvbGljeWlkXG4pICBPTiAodmFsaWRhdGVkYXQgPSBsYXRlc3RfdmFsaWRhdGVkYXQpKVxuIiwiY2F0YWxvZyI6ImF3c2RhdGFjYXRhbG9nIiwic2NoZW1hIjoiYWNjZXNzX2FuYWx5emVyX2ZpbmRpbmdzIiwiY29sdW1ucyI6W3sibmFtZSI6InBvbGljeUFybiIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoicG9saWN5dHlwZSIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoicGF0aCIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoicG9saWN5aWQiLCJ0eXBlIjoidmFyY2hhciJ9LHsibmFtZSI6InBvbGljeW5hbWUiLCJ0eXBlIjoidmFyY2hhciJ9LHsibmFtZSI6InZhbGlkYXRlZGF0IiwidHlwZSI6InZhcmNoYXIifSx7Im5hbWUiOiJmaW5kaW5ndHlwZSIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoiaXNzdWVjb2RlIiwidHlwZSI6InZhcmNoYXIifSx7Im5hbWUiOiJmaW5kaW5nZGV0YWlscyIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoibGVhcm5tb3JlbGluayIsInR5cGUiOiJ2YXJjaGFyIn0seyJuYW1lIjoiZGF0ZWhvdXIiLCJ0eXBlIjoidmFyY2hhciJ9XX0=
+          */
+  ###########################
+  # Amazon Athena resources #
+  ###########################
+  AthenaWorkGroupS3Bucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: "Access intended only within the same account"
+    Properties:
+      BucketName: !Sub aws-athena-query-results-${AWS::AccountId}-access-analyzer
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+  AthenaWorkGroupConfig:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: access-analyzer-findings-workgroup
+      Description: IAM Access Analyzer findings workgroup.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaWorkGroupS3Bucket}/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+      Tags:
+      - Key: 'CloudFormation::StackId'
+        Value: !Ref AWS::StackId
+      - Key: 'CloudFormation::StackName'
+        Value: !Ref AWS::StackName
