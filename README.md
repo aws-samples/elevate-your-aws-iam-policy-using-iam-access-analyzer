@@ -67,8 +67,9 @@ This section describes the pre-requisites you must have in order to sucessfully 
    - Type in a unique account name for Amazon QuickSight. For example, use `yourname-YYYYMMDD-quicksight` in the **QuickSight account name** field. Your account name can only contain characters \(A–Z and a–z\), digits \(0–9\), and hyphens \(\-\)\.
    - Type in a notification email addess in the **Notification email address** field. This email receives service and usage notifications\.
 6. Ensure **Enable autodiscovery of data and users in your Amazon Redshift, Amazon RDS, and AWS IAM services.**, **Amazon Athena** and **Amazon S3** checkboxes are checked.
-7. Review the choices you made, then choose **Finish**\.
-8. Once the Amazon QuickSight account creation process is finished, choose **Go to Amazon QuickSight** to go to the Amazon QuickSight home page.
+7. Provide access to the relevant S3 buckets to QuickSight (prefixed by qs-iam-aa-*)
+8. Review the choices you made, then choose **Finish**\.
+9. Once the Amazon QuickSight account creation process is finished, choose **Go to Amazon QuickSight** to go to the Amazon QuickSight home page.
 
 ### Create a new Dataset
 1. Open Amazon QuickSight from the AWS Management Console\. It is located under Analytics, and you can find it by searching for "QuickSight"\. On the left pane, choose **Datasets**.
@@ -82,7 +83,7 @@ This section describes the pre-requisites you must have in order to sucessfully 
 9. In the new view, choose the **String** field under the **validatedat** column. From the Dropdown select `Date`.
 10. In the pop up window, type in `yyyy-MM-dd'T'HH:mm:ss.SSSSSS` as value in the date format field and confirm with **Update**
 11. Repeat the same for the **datehour** field. Choose the **String** field under the **datehour** column, type in `yyyy/MM/dd` and confirm with **Update**
-12. On the top right corner, save your changes with **Save**.
+12. On the top right corner, save your changes with **Save & Publish**.
 13. Go back to the QuickSight home page and open the newly created dataset. In the popup window select **Create analysis**.
 
 ### Create QuickSight Analysis - Visual: Count of Records by Finding Type
